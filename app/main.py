@@ -10,6 +10,7 @@ POST /api/recommend chains:
 import logging
 
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import ValidationError
 
@@ -32,6 +33,20 @@ app.add_middleware(
 )
 
 llm_service = llm.LLMService()
+
+
+@app.get("/", include_in_schema=False)
+async def root() -> JSONResponse:
+    """Provide a concise production landing response for the public API URL."""
+    return JSONResponse(
+        {
+            "service": "Smart Recommender API",
+            "status": "ok",
+            "health": "/health",
+            "recommend": "/api/recommend",
+            "docs": "/docs",
+        }
+    )
 
 
 @app.get("/health")
@@ -57,7 +72,9 @@ async def recommend(req: RecommendRequest) -> VsGridResponse | PivotResponse:
     top_10 = ranker.tfidf_rank(survivors, constraints.soft_preferences, top_n=10)
 
     # ── Phase 3: fork ─────────────────────────────────────────────────────────
-    if top_10:
+    # The Vs. Grid contract requires two real products. A single survivor is an
+    # insufficient comparison set, so pivot instead of returning a fake card.
+    if len(top_10) >= 2:
         return await _path_a(constraints, top_10)
 
     return await _path_b(constraints)

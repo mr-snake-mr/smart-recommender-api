@@ -17,7 +17,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from fastapi.testclient import TestClient  # noqa: E402
 
 from app.schemas import Product  # noqa: E402
-from app.services import catalog  # noqa: E402
+from app.services import catalog, llm  # noqa: E402
 import app.main as main_mod  # noqa: E402
 
 # ── Stub catalog (FakeStore-shaped) ───────────────────────────────────────────
@@ -69,6 +69,8 @@ check("match_2 is Samsung 4K (id 4)", body.get("match_2", {}).get("id") == 4, st
 check("math score merged into match_1", isinstance(body.get("match_1", {}).get("similarity_score"), float), str(body))
 check("match_1 has 2 pros + 1 con", len(body.get("match_1", {}).get("pros", [])) == 2 and len(body.get("match_1", {}).get("cons", [])) == 1, str(body.get("match_1")))
 check("refurbished item (id 3) was filtered out", all(m["id"] != 3 for m in (body.get("match_1"), body.get("match_2"))), str(body))
+extracted = llm._mock_extract("I need a coding laptop under $1000 with a great screen, no refurbished models.")
+check("only refurbished is the dealbreaker", extracted.must_not_include == ["refurbished"], str(extracted.model_dump()))
 
 # ── Test 2: Path B — unmet constraints → pivot + analytics ────────────────────
 print("\n[2] Path B: 'wireless earbuds under $20' (nothing that cheap exists)")
@@ -82,8 +84,36 @@ check("suggested_action non-empty", bool(body.get("suggested_action")), str(body
 check("analytics event fired once", len(analytics_calls) == 1, str(analytics_calls))
 check("analytics captured max_price=20", analytics_calls and analytics_calls[0]["max_price"] == 20.0, str(analytics_calls))
 
-# ── Test 3: validation + health ───────────────────────────────────────────────
-print("\n[3] Validation & health")
+# ── Test 3: one survivor pivots instead of returning a fake second product ─────
+print("\n[3] One filtered product -> pivot, never a placeholder match")
+original_fetch_products = catalog.fetch_products
+
+async def one_product_catalog(force_refresh: bool = False) -> list[Product]:
+    return [Product(**SAMPLE_CATALOG[1])]
+
+catalog.fetch_products = one_product_catalog
+r = client.post("/api/recommend", json={"query": "coding laptop under $1000"})
+body = r.json()
+check("single survivor returns HTTP 200", r.status_code == 200, str(r.status_code))
+check("single survivor outcome == unmet_constraint", body.get("outcome") == "unmet_constraint", str(body))
+check("single survivor has no fake product", body.get("match_2") is None, str(body))
+catalog.fetch_products = original_fetch_products
+
+# ── Test 4: catalog fallback normalization ─────────────────────────────────────
+print("\n[4] Catalog fallback normalizes laptop data")
+fallback_products = catalog._coerce_dummyjson_products({"products": [{
+    "id": 82, "title": "New DELL XPS 13", "price": 999.0,
+    "category": "laptops", "description": "new coding laptop with a sharp display",
+    "rating": 4.6, "stock": 7,
+}]})
+check("fallback has one product", len(fallback_products) == 1, str(fallback_products))
+check("fallback maps laptops to electronics", fallback_products[0].category == "electronics", str(fallback_products[0]))
+check("fallback maps rating", fallback_products[0].rating_value == 4.6, str(fallback_products[0]))
+
+# ── Test 5: public service metadata, validation + health ───────────────────────
+print("\n[5] Public service metadata, validation & health")
+r = client.get("/")
+check("root service metadata", r.status_code == 200 and r.json().get("service") == "Smart Recommender API", str(r.text))
 r = client.post("/api/recommend", json={"query": ""})
 check("empty query -> 422", r.status_code == 422, str(r.status_code))
 r = client.get("/health")

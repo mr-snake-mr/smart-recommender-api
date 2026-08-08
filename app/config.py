@@ -13,8 +13,9 @@ class Settings(BaseSettings):
     llm_model: str = "gpt-4o-mini"
     llm_mock_mode: bool = False
 
-    # Catalog source
+    # Catalog sources. The fallback is used only when the primary source is unavailable.
     fakestore_api_url: str = "https://fakestoreapi.com/products"
+    fallback_catalog_api_url: str = "https://dummyjson.com/products?limit=100"
     catalog_cache_ttl_seconds: int = 300
 
     # Analytics logging (Path B)

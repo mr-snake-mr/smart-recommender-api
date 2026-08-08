@@ -163,7 +163,10 @@ def _mock_extract(query: str) -> ExtractedConstraints:
 
     # Dealbreakers: noun phrases after negation markers, plus known red flags.
     must_not: list[str] = []
-    for marker in ("absolutely no", "no refurbished", "without", "never", "avoid", "no", "not", "excluding", "except"):
+    # "no" already captures the noun after a phrase such as "no refurbished
+    # models". Including "no refurbished" here would incorrectly extract
+    # "models" as an additional dealbreaker.
+    for marker in ("absolutely no", "without", "never", "avoid", "no", "not", "excluding", "except"):
         idx = text.find(marker)
         if idx == -1:
             continue
@@ -200,11 +203,19 @@ _STOPWORDS_EXTRA = {"and", "or", "but", "with", "that", "this", "for", "any", "s
 
 
 def _mock_judge(soft_preferences: list[str], top_10: list[dict[str, Any]]) -> dict[str, Any]:
+    """Produce a schema-valid deterministic response for mock mode.
+
+    The API contract always requires two real recommendation cards. When a
+    catalog supplies only one survivor, the caller should use the pivot path
+    instead of fabricating a placeholder product.
+    """
+    if len(top_10) < 2:
+        raise LLMResponseError("Judge requires at least two filtered products")
+
     prefs = ", ".join(soft_preferences) if soft_preferences else "your requirements"
     prefs_lower = prefs.lower()
-    picks = top_10[:2]
     matches = {}
-    for slot, item in zip(("match_1", "match_2"), picks):
+    for slot, item in zip(("match_1", "match_2"), top_10[:2]):
         pid = int(item.get("id", 0))
         name = str(item.get("title", f"Product #{pid}"))
         desc = str(item.get("description", "")).lower()
@@ -212,7 +223,6 @@ def _mock_judge(soft_preferences: list[str], top_10: list[dict[str, Any]]) -> di
         pros = [f"Matches your '{p}' preference" for p in found[:2]]
         while len(pros) < 2:
             pros.append("Within your stated budget")
-            break
         cons = [f"Not explicitly tailored to '{prefs}'"] if prefs_lower and prefs != "your requirements" else ["Only two finalists selected"]
         matches[slot] = {
             "id": pid,
@@ -220,14 +230,6 @@ def _mock_judge(soft_preferences: list[str], top_10: list[dict[str, Any]]) -> di
             "why_it_won": f"Best TF-IDF match for: {prefs}",
             "pros": pros[:2],
             "cons": cons[:1],
-        }
-    if len(picks) < 2:  # only one survivor
-        matches["match_2"] = {
-            "id": -1,
-            "name": "No second finalist in the filtered set",
-            "why_it_won": "Only one product met every hard constraint",
-            "pros": [],
-            "cons": [],
         }
     return matches
 

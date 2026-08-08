@@ -102,7 +102,8 @@ banner. Error responses: `502` (LLM output unparseable), `503` (catalog API down
 |---|---|---|
 | `OPENAI_API_KEY` / `OPENAI_BASE_URL` / `LLM_MODEL` | — / `https://api.openai.com/v1` / `gpt-4o-mini` | Any OpenAI-compatible endpoint (OpenAI, DeepSeek, Ollama...) |
 | `LLM_MOCK_MODE` | `false` | `true` = deterministic mock, zero API calls |
-| `FAKESTORE_API_URL` | `https://fakestoreapi.com/products` | Catalog source |
+| `FAKESTORE_API_URL` | `https://fakestoreapi.com/products` | Primary catalog source |
+| `FALLBACK_CATALOG_API_URL` | `https://dummyjson.com/products?limit=100` | Fallback source used when the primary source is unavailable |
 | `CATALOG_CACHE_TTL_SECONDS` | `300` | In-process catalog cache TTL |
 | `ANALYTICS_BACKEND` | (empty) | `redis` or `supabase` to log unmet constraints for the `/admin` dashboard |
 | `REDIS_URL` / `SUPABASE_URL` / `SUPABASE_ANON_KEY` / `SUPABASE_TABLE` | — | Backend-specific credentials |

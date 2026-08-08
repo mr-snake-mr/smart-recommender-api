@@ -1,0 +1,8 @@
+[project]
+name = "smart-recommender-api"
+version = "1.0.1"
+description = "Reliable FastAPI product recommendation service"
+requires-python = ">=3.12"
+
+[tool.vercel]
+entrypoint = "app.main:app"

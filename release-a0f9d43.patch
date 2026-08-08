@@ -1,0 +1,371 @@
+From a0f9d43122b680b486ca5747ce6ad520910a58b2 Mon Sep 17 00:00:00 2001
+From: Accio Assistant <assistant@accio.local>
+Date: Sat, 8 Aug 2026 15:34:18 +0800
+Subject: [PATCH] Harden recommender and add production deployment config
+
+---
+ .env.example            |  4 ++-
+ .python-version         |  1 +
+ README.md               |  3 +-
+ app/config.py           |  3 +-
+ app/main.py             | 19 ++++++++++-
+ app/services/catalog.py | 74 +++++++++++++++++++++++++++++++----------
+ app/services/llm.py     | 26 ++++++++-------
+ pyproject.toml          |  8 +++++
+ scripts/smoke_test.py   | 36 ++++++++++++++++++--
+ vercel.json             |  9 +++++
+ 10 files changed, 146 insertions(+), 37 deletions(-)
+ create mode 100644 .python-version
+ create mode 100644 pyproject.toml
+ create mode 100644 vercel.json
+
+diff --git a/.env.example b/.env.example
+index ef4c2ee..c840392 100644
+--- a/.env.example
++++ b/.env.example
+@@ -8,8 +8,10 @@ LLM_MODEL=gpt-4o-mini
+ # mock responses — great for demos, CI, and the /admin dashboard smoke tests.
+ LLM_MOCK_MODE=false
+ 
+-# ── Catalog source ────────────────────────────────────────────────────────────
++# ── Catalog sources ───────────────────────────────────────────────────────────
++# The fallback is used automatically when the primary source is unavailable.
+ FAKESTORE_API_URL=https://fakestoreapi.com/products
++FALLBACK_CATALOG_API_URL=https://dummyjson.com/products?limit=100
+ CATALOG_CACHE_TTL_SECONDS=300
+ 
+ # ── Analytics logging (Path B "hackathon flex") ──────────────────────────────
+diff --git a/.python-version b/.python-version
+new file mode 100644
+index 0000000..e4fba21
+--- /dev/null
++++ b/.python-version
+@@ -0,0 +1 @@
++3.12
+diff --git a/README.md b/README.md
+index eef9eb7..1a7ede5 100644
+--- a/README.md
++++ b/README.md
+@@ -102,7 +102,8 @@ banner. Error responses: `502` (LLM output unparseable), `503` (catalog API down
+ |---|---|---|
+ | `OPENAI_API_KEY` / `OPENAI_BASE_URL` / `LLM_MODEL` | — / `https://api.openai.com/v1` / `gpt-4o-mini` | Any OpenAI-compatible endpoint (OpenAI, DeepSeek, Ollama...) |
+ | `LLM_MOCK_MODE` | `false` | `true` = deterministic mock, zero API calls |
+-| `FAKESTORE_API_URL` | `https://fakestoreapi.com/products` | Catalog source |
++| `FAKESTORE_API_URL` | `https://fakestoreapi.com/products` | Primary catalog source |
++| `FALLBACK_CATALOG_API_URL` | `https://dummyjson.com/products?limit=100` | Fallback source used when the primary source is unavailable |
+ | `CATALOG_CACHE_TTL_SECONDS` | `300` | In-process catalog cache TTL |
+ | `ANALYTICS_BACKEND` | (empty) | `redis` or `supabase` to log unmet constraints for the `/admin` dashboard |
+ | `REDIS_URL` / `SUPABASE_URL` / `SUPABASE_ANON_KEY` / `SUPABASE_TABLE` | — | Backend-specific credentials |
+diff --git a/app/config.py b/app/config.py
+index f7aa9de..116c2f5 100644
+--- a/app/config.py
++++ b/app/config.py
+@@ -13,8 +13,9 @@ class Settings(BaseSettings):
+     llm_model: str = "gpt-4o-mini"
+     llm_mock_mode: bool = False
+ 
+-    # Catalog source
++    # Catalog sources. The fallback is used only when the primary source is unavailable.
+     fakestore_api_url: str = "https://fakestoreapi.com/products"
++    fallback_catalog_api_url: str = "https://dummyjson.com/products?limit=100"
+     catalog_cache_ttl_seconds: int = 300
+ 
+     # Analytics logging (Path B)
+diff --git a/app/main.py b/app/main.py
+index 0f436ba..99d2b8e 100644
+--- a/app/main.py
++++ b/app/main.py
+@@ -10,6 +10,7 @@ POST /api/recommend chains:
+ import logging
+ 
+ from fastapi import FastAPI, HTTPException
++from fastapi.responses import JSONResponse
+ from fastapi.middleware.cors import CORSMiddleware
+ from pydantic import ValidationError
+ 
+@@ -34,6 +35,20 @@ app.add_middleware(
+ llm_service = llm.LLMService()
+ 
+ 
++@app.get("/", include_in_schema=False)
++async def root() -> JSONResponse:
++    """Provide a concise production landing response for the public API URL."""
++    return JSONResponse(
++        {
++            "service": "Smart Recommender API",
++            "status": "ok",
++            "health": "/health",
++            "recommend": "/api/recommend",
++            "docs": "/docs",
++        }
++    )
++
++
+ @app.get("/health")
+ async def health() -> dict[str, str]:
+     return {"status": "ok"}
+@@ -57,7 +72,9 @@ async def recommend(req: RecommendRequest) -> VsGridResponse | PivotResponse:
+     top_10 = ranker.tfidf_rank(survivors, constraints.soft_preferences, top_n=10)
+ 
+     # ── Phase 3: fork ─────────────────────────────────────────────────────────
+-    if top_10:
++    # The Vs. Grid contract requires two real products. A single survivor is an
++    # insufficient comparison set, so pivot instead of returning a fake card.
++    if len(top_10) >= 2:
+         return await _path_a(constraints, top_10)
+ 
+     return await _path_b(constraints)
+diff --git a/app/services/catalog.py b/app/services/catalog.py
+index 20257cb..0d18cd0 100644
+--- a/app/services/catalog.py
++++ b/app/services/catalog.py
+@@ -1,5 +1,6 @@
+-"""Catalog fetching from the FakeStore API with an in-process TTL cache."""
++"""Catalog fetching with a primary provider, fallback provider, and TTL cache."""
+ import time
++from typing import Any
+ 
+ import httpx
+@@ -10,11 +11,11 @@ _cache: dict[str, object] = {"products": None, "fetched_at": 0.0}
+ 
+ 
+ class CatalogFetchError(RuntimeError):
+-    """Raised when the FakeStore API cannot be reached."""
++    """Raised when every configured catalog source is unavailable."""
+ 
+ 
+ async def fetch_products(force_refresh: bool = False) -> list[Product]:
+-    """Return the full catalog, reusing a cached copy for TTL seconds."""
++    """Return a normalized catalog, using a fallback if the primary source fails."""
+     settings = get_settings()
+     now = time.time()
+@@ -25,24 +26,61 @@ async def fetch_products(force_refresh: bool = False) -> list[Product]:
+     ):
+         return list(_cache["products"])  # type: ignore[arg-type]
+ 
+-    try:
+-        async with httpx.AsyncClient(timeout=10.0) as client:
+-            resp = await client.get(settings.fakestore_api_url)
+-            resp.raise_for_status()
+-            raw = resp.json()
+-    except (httpx.HTTPError, ValueError) as exc:
+-        # Fall back to a stale cache if we have one; otherwise surface the error.
+-        if _cache["products"] is not None:
+-            return list(_cache["products"])  # type: ignore[arg-type]
+-        raise CatalogFetchError(f"Failed to fetch catalog from FakeStore API: {exc}") from exc
++    errors: list[str] = []
++    async with httpx.AsyncClient(timeout=10.0) as client:
++        for url, adapter in (
++            (settings.fakestore_api_url, _coerce_fakestore_products),
++            (settings.fallback_catalog_api_url, _coerce_dummyjson_products),
++        ):
++            if not url:
++                continue
++            try:
++                response = await client.get(url)
++                response.raise_for_status()
++                products = adapter(response.json())
++                if not products:
++                    raise ValueError("catalog contained no usable products")
++                _cache["products"] = products
++                _cache["fetched_at"] = now
++                return products
++            except (httpx.HTTPError, ValueError, TypeError) as exc:
++                errors.append(f"{url}: {exc}")
+ 
+-    products = [_coerce_product(item) for item in raw if isinstance(item, dict)]
+-    _cache["products"] = products
+-    _cache["fetched_at"] = now
+-    return products
++    # Keep serving the last valid catalog during transient upstream outages.
++    if _cache["products"] is not None:
++        return list(_cache["products"])  # type: ignore[arg-type]
++    raise CatalogFetchError("Failed to fetch a catalog from configured sources: " + "; ".join(errors))
++
++
++def _coerce_fakestore_products(raw: Any) -> list[Product]:
++    if not isinstance(raw, list):
++        raise ValueError("expected a list of products")
++    return [_coerce_product(item) for item in raw if isinstance(item, dict)]
++
++
++def _coerce_dummyjson_products(raw: Any) -> list[Product]:
++    if not isinstance(raw, dict) or not isinstance(raw.get("products"), list):
++        raise ValueError("expected a DummyJSON products payload")
++
++    normalized: list[Product] = []
++    for item in raw["products"]:
++        if not isinstance(item, dict):
++            continue
++        category = "electronics" if str(item.get("category", "")).lower() == "laptops" else str(item.get("category", ""))
++        normalized.append(
++            Product(
++                id=int(item.get("id", 0)),
++                title=str(item.get("title", "")),
++                price=float(item.get("price", 0.0)),
++                category=category,
++                description=str(item.get("description", "")),
++                rating={"rate": item.get("rating", 0.0), "count": item.get("stock", 0)},
++            )
++        )
++    return normalized
+ 
+ 
+-def _coerce_product(item: dict) -> Product:
++def _coerce_product(item: dict[str, Any]) -> Product:
+     return Product(
+         id=int(item.get("id", 0)),
+         title=str(item.get("title", "")),
+diff --git a/app/services/llm.py b/app/services/llm.py
+index cbeff04..12b1273 100644
+--- a/app/services/llm.py
++++ b/app/services/llm.py
+@@ -163,7 +163,10 @@ def _mock_extract(query: str) -> ExtractedConstraints:
+ 
+     # Dealbreakers: noun phrases after negation markers, plus known red flags.
+     must_not: list[str] = []
+-    for marker in ("absolutely no", "no refurbished", "without", "never", "avoid", "no", "not", "excluding", "except"):
++    # "no" already captures the noun after a phrase such as "no refurbished
++    # models". Including "no refurbished" here would incorrectly extract
++    # "models" as an additional dealbreaker.
++    for marker in ("absolutely no", "without", "never", "avoid", "no", "not", "excluding", "except"):
+         idx = text.find(marker)
+         if idx == -1:
+             continue
+@@ -200,11 +203,19 @@ _STOPWORDS_EXTRA = {"and", "or", "but", "with", "that", "this", "for", "any", "s
+ 
+ 
+ def _mock_judge(soft_preferences: list[str], top_10: list[dict[str, Any]]) -> dict[str, Any]:
++    """Produce a schema-valid deterministic response for mock mode.
++
++    The API contract always requires two real recommendation cards. When a
++    catalog supplies only one survivor, the caller should use the pivot path
++    instead of fabricating a placeholder product.
++    """
++    if len(top_10) < 2:
++        raise LLMResponseError("Judge requires at least two filtered products")
++
+     prefs = ", ".join(soft_preferences) if soft_preferences else "your requirements"
+     prefs_lower = prefs.lower()
+-    picks = top_10[:2]
+     matches = {}
+-    for slot, item in zip(("match_1", "match_2"), picks):
++    for slot, item in zip(("match_1", "match_2"), top_10[:2]):
+         pid = int(item.get("id", 0))
+         name = str(item.get("title", f"Product #{pid}"))
+         desc = str(item.get("description", "")).lower()
+@@ -212,7 +223,6 @@ def _mock_judge(soft_preferences: list[str], top_10: list[dict[str, Any]]) -> di
+         pros = [f"Matches your '{p}' preference" for p in found[:2]]
+         while len(pros) < 2:
+             pros.append("Within your stated budget")
+-            break
+         cons = [f"Not explicitly tailored to '{prefs}'"] if prefs_lower and prefs != "your requirements" else ["Only two finalists selected"]
+         matches[slot] = {
+             "id": pid,
+@@ -221,14 +231,6 @@ def _mock_judge(soft_preferences: list[str], top_10: list[dict[str, Any]]) -> di
+             "pros": pros[:2],
+             "cons": cons[:1],
+         }
+-    if len(picks) < 2:  # only one survivor
+-        matches["match_2"] = {
+-            "id": -1,
+-            "name": "No second finalist in the filtered set",
+-            "why_it_won": "Only one product met every hard constraint",
+-            "pros": [],
+-            "cons": [],
+-        }
+     return matches
+ 
+ 
+diff --git a/pyproject.toml b/pyproject.toml
+new file mode 100644
+index 0000000..8bfc22c
+--- /dev/null
++++ b/pyproject.toml
+@@ -0,0 +1,8 @@
++[project]
++name = "smart-recommender-api"
++version = "1.0.1"
++description = "Reliable FastAPI product recommendation service"
++requires-python = ">=3.12"
++
++[tool.vercel]
++entrypoint = "app.main:app"
+diff --git a/scripts/smoke_test.py b/scripts/smoke_test.py
+index 4c83180..99d358c 100644
+--- a/scripts/smoke_test.py
++++ b/scripts/smoke_test.py
+@@ -17,7 +17,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+ from fastapi.testclient import TestClient  # noqa: E402
+ 
+ from app.schemas import Product  # noqa: E402
+-from app.services import catalog  # noqa: E402
++from app.services import catalog, llm  # noqa: E402
+ import app.main as main_mod  # noqa: E402
+ 
+ # ── Stub catalog (FakeStore-shaped) ───────────────────────────────────────────
+@@ -69,6 +69,8 @@ check("match_2 is Samsung 4K (id 4)", body.get("match_2", {}).get("id") == 4, st
+ check("math score merged into match_1", isinstance(body.get("match_1", {}).get("similarity_score"), float), str(body))
+ check("match_1 has 2 pros + 1 con", len(body.get("match_1", {}).get("pros", [])) == 2 and len(body.get("match_1", {}).get("cons", [])) == 1, str(body.get("match_1")))
+ check("refurbished item (id 3) was filtered out", all(m["id"] != 3 for m in (body.get("match_1"), body.get("match_2"))), str(body))
++extracted = llm._mock_extract("I need a coding laptop under $1000 with a great screen, no refurbished models.")
++check("only refurbished is the dealbreaker", extracted.must_not_include == ["refurbished"], str(extracted.model_dump()))
+ 
+ # ── Test 2: Path B — unmet constraints → pivot + analytics ────────────────────
+ print("\n[2] Path B: 'wireless earbuds under $20' (nothing that cheap exists)")
+@@ -82,8 +84,36 @@ check("suggested_action non-empty", bool(body.get("suggested_action")), str(body
+ check("analytics event fired once", len(analytics_calls) == 1, str(analytics_calls))
+ check("analytics captured max_price=20", analytics_calls and analytics_calls[0]["max_price"] == 20.0, str(analytics_calls))
+ 
+-# ── Test 3: validation + health ───────────────────────────────────────────────
+-print("\n[3] Validation & health")
++# ── Test 3: one survivor pivots instead of returning a fake second product ─────
++print("\n[3] One filtered product -> pivot, never a placeholder match")
++original_fetch_products = catalog.fetch_products
++
++async def one_product_catalog(force_refresh: bool = False) -> list[Product]:
++    return [Product(**SAMPLE_CATALOG[1])]
++
++catalog.fetch_products = one_product_catalog
++r = client.post("/api/recommend", json={"query": "coding laptop under $1000"})
++body = r.json()
++check("single survivor returns HTTP 200", r.status_code == 200, str(r.status_code))
++check("single survivor outcome == unmet_constraint", body.get("outcome") == "unmet_constraint", str(body))
++check("single survivor has no fake product", body.get("match_2") is None, str(body))
++catalog.fetch_products = original_fetch_products
++
++# ── Test 4: catalog fallback normalization ─────────────────────────────────────
++print("\n[4] Catalog fallback normalizes laptop data")
++fallback_products = catalog._coerce_dummyjson_products({"products": [{
++    "id": 82, "title": "New DELL XPS 13", "price": 999.0,
++    "category": "laptops", "description": "new coding laptop with a sharp display",
++    "rating": 4.6, "stock": 7,
++}]})
++check("fallback has one product", len(fallback_products) == 1, str(fallback_products))
++check("fallback maps laptops to electronics", fallback_products[0].category == "electronics", str(fallback_products[0]))
++check("fallback maps rating", fallback_products[0].rating_value == 4.6, str(fallback_products[0]))
++
++# ── Test 5: public service metadata, validation + health ───────────────────────
++print("\n[5] Public service metadata, validation & health")
++r = client.get("/")
++check("root service metadata", r.status_code == 200 and r.json().get("service") == "Smart Recommender API", str(r.text))
+ r = client.post("/api/recommend", json={"query": ""})
+ check("empty query -> 422", r.status_code == 422, str(r.status_code))
+ r = client.get("/health")
+diff --git a/vercel.json b/vercel.json
+new file mode 100644
+index 0000000..9d0773c
+--- /dev/null
++++ b/vercel.json
+@@ -0,0 +1,9 @@
++{
++  "$schema": "https://openapi.vercel.sh/vercel.json",
++  "functions": {
++    "app/main.py": {
++      "maxDuration": 60,
++      "excludeFiles": "{scripts/**,.venv/**}"
++    }
++  }
++}
+-- 
+2.43.0
